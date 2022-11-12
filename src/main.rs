@@ -233,12 +233,18 @@ fn extract_logs(repo_url: &str) -> Result<(), git2::Error> {
             changes: Vec::new(),
         };
 
+        // If it's a merge type (multiple parents), then we ignore the file changes
+        //
         let my_commit = if commit.parent_count() > 1 {
             Commit {
                 r#type: CommitType::Merge,
                 ..default_commit
             }
-        } else {
+        }
+        // If it's a normal single (or zero) parent commit, then we process the diff
+        // to the parent to grab file changes
+        //
+        else {
             let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&commit_tree), None)?;
             let file_changes = extract_from_diff(&diff)?;
             Commit {
