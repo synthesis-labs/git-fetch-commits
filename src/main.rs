@@ -16,6 +16,12 @@ struct FileChange {
 }
 
 #[derive(Serialize, Debug)]
+enum CommitType {
+    Normal,
+    Merge,
+}
+
+#[derive(Serialize, Debug)]
 struct Commit {
     id: String,
     repo_url: String,
@@ -23,6 +29,7 @@ struct Commit {
     author_name: String,
     author_email: String,
     message: String,
+    r#type: CommitType,
     changes: Vec<FileChange>,
 }
 
@@ -205,39 +212,46 @@ fn extract_logs(repo_url: &str) -> Result<(), git2::Error> {
 
         // ignore any commits which have more than 1 parent (i.e. a merge)
         //
-        if commit.parent_count() <= 1 {
-            let parent_commit = if commit.parent_count() == 0 {
-                // Its the head
-                //
-                None
-            } else {
-                Some(commit.parent(0).unwrap().tree_id())
-            };
+        let parent_commit = if commit.parent_count() == 0 {
+            // Its the origin commit (the seed of the tree)
+            //
+            None
+        } else {
+            Some(commit.parent(0).unwrap().tree_id())
+        };
 
-            let parent_tree = parent_commit.map(|oid| repo.find_tree(oid).unwrap());
+        let parent_tree = parent_commit.map(|oid| repo.find_tree(oid).unwrap());
 
+        let default_commit = Commit {
+            id: oid.to_string(),
+            r#type: CommitType::Normal,
+            repo_url: repo_url.to_string(),
+            timestamp: commit.time().seconds(),
+            author_name: commit.author().name().unwrap_or("unknown").to_string(),
+            author_email: commit.author().email().unwrap_or("unknown").to_string(),
+            message: commit.message().unwrap_or("unknown").to_string(),
+            changes: Vec::new(),
+        };
+
+        let my_commit = if commit.parent_count() > 1 {
+            Commit {
+                r#type: CommitType::Merge,
+                ..default_commit
+            }
+        } else {
             let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&commit_tree), None)?;
             let file_changes = extract_from_diff(&diff)?;
-
-            let my_commit = Commit {
-                id: oid.to_string(),
-                repo_url: repo_url.to_string(),
-                timestamp: commit.time().seconds(),
-                author_name: commit.author().name().unwrap_or("unknown").to_string(),
-                author_email: commit.author().email().unwrap_or("unknown").to_string(),
-                message: commit.message().unwrap_or("unknown").to_string(),
+            Commit {
+                r#type: CommitType::Normal,
                 changes: file_changes,
-            };
+                ..default_commit
+            }
+        };
 
-            let my_commit_json = serde_json::to_string(&my_commit)
-                .map_err(|_e| git2::Error::from_str("Serde failed!"))?;
+        let my_commit_json = serde_json::to_string(&my_commit)
+            .map_err(|_e| git2::Error::from_str("Serde failed!"))?;
 
-            println!("{}", my_commit_json);
-        } else {
-            // Ignore merge type commits!
-            //
-            // println!("[Ignoring merge type commit]");
-        }
+        println!("{}", my_commit_json);
     }
 
     Ok(())
