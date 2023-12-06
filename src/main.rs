@@ -1,4 +1,4 @@
-use byte_unit::Byte;
+use byte_unit::{Byte, UnitType};
 use git2::{Cred, Diff, RemoteCallbacks, Sort};
 use serde::Serialize;
 use std::{cell::Cell, env, str::FromStr};
@@ -15,7 +15,7 @@ struct FileChange {
     hunks_modified: u32,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 enum CommitType {
     Normal,
     Merge,
@@ -31,6 +31,24 @@ struct Commit {
     message: String,
     r#type: CommitType,
     changes: Vec<FileChange>,
+}
+
+#[derive(Serialize, Debug)]
+struct FlatCommit {
+    id: String,
+    repo_url: String,
+    timestamp: i64,
+    author_name: String,
+    author_email: String,
+    message: String,
+    r#type: CommitType,
+    path: String,
+    lines_added: u32,
+    lines_removed: u32,
+    lines_modified: u32,
+    hunks_added: u32,
+    hunks_removed: u32,
+    hunks_modified: u32,
 }
 
 fn extract_from_diff(diff: &Diff) -> Result<Vec<FileChange>, git2::Error> {
@@ -135,13 +153,14 @@ fn extract_logs(repo_url: &str) -> Result<(), git2::Error> {
     });
 
     callbacks.transfer_progress(|progress| {
-        let adjusted_byte = Byte::from_bytes(u128::try_from(progress.received_bytes()).unwrap());
+        let adjusted_byte =
+            Byte::from_u128(u128::try_from(progress.received_bytes()).unwrap()).unwrap();
         eprintln!(
             "Progress => Received {} of {}, indexed {}, bytes {}",
             progress.received_objects(),
             progress.total_objects(),
             progress.indexed_objects(),
-            adjusted_byte.get_appropriate_unit(false)
+            adjusted_byte.get_appropriate_unit(UnitType::Binary)
         );
         true
     });
@@ -254,10 +273,39 @@ fn extract_logs(repo_url: &str) -> Result<(), git2::Error> {
             }
         };
 
-        let my_commit_json = serde_json::to_string(&my_commit)
-            .map_err(|_e| git2::Error::from_str("Serde failed!"))?;
+        let flat: Vec<FlatCommit> = my_commit
+            .changes
+            .iter()
+            .map(|change| FlatCommit {
+                id: my_commit.id.clone(),
+                r#type: my_commit.r#type.clone(),
+                repo_url: my_commit.repo_url.clone(),
+                timestamp: my_commit.timestamp.clone(),
+                author_name: my_commit.author_name.clone(),
+                author_email: my_commit.author_email.clone(),
+                message: my_commit.message.clone(),
+                path: change.path.clone(),
+                lines_added: change.lines_added.clone(),
+                lines_removed: change.lines_removed.clone(),
+                lines_modified: change.lines_modified.clone(),
+                hunks_added: change.hunks_added.clone(),
+                hunks_removed: change.hunks_removed.clone(),
+                hunks_modified: change.hunks_modified.clone(),
+            })
+            .collect();
 
-        println!("{}", my_commit_json);
+        flat.iter().for_each(|f| {
+            let my_flat_json =
+                serde_json::to_string(&f).map_err(|_e| git2::Error::from_str("Serde failed!"));
+
+            if let Ok(f) = my_flat_json {
+                println!("{}", f);
+            }
+            //
+            //Ok(())
+        });
+
+        //println!("{}", flat);
     }
 
     Ok(())
