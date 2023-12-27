@@ -1,7 +1,9 @@
 use byte_unit::{Byte, UnitType};
+use clap::Parser;
 use git2::{Cred, Diff, RemoteCallbacks, Sort};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::Serialize;
-use std::{cell::Cell, env, str::FromStr};
+use std::{cell::Cell, str::FromStr};
 use tempfile::tempdir;
 
 #[derive(Serialize, Clone, Debug)]
@@ -136,47 +138,103 @@ fn extract_from_diff(diff: &Diff) -> Result<Vec<FileChange>, git2::Error> {
     Ok(files)
 }
 
-fn extract_logs(repo_url: &str) -> Result<(), git2::Error> {
+fn extract_logs(args: &Args) -> Result<(), git2::Error> {
+    let multiprogress = MultiProgress::new();
+
+    let sty = ProgressStyle::with_template(
+        "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
+    )
+    .unwrap()
+    .progress_chars("#>-");
+
+    let progress_client = multiprogress.add(ProgressBar::new(1));
+    let progress_server = multiprogress.add(ProgressBar::new(1));
+    let progress_transfer = multiprogress.add(ProgressBar::new(1));
+    let progress_indexing = multiprogress.add(ProgressBar::new(1));
+    progress_client.set_style(sty.clone());
+    progress_client.set_message("Client progress");
+    progress_server.set_style(sty.clone());
+    progress_server.set_message("Server progress");
+    progress_transfer.set_style(sty.clone());
+    progress_transfer.set_message("Transfer progress");
+    progress_indexing.set_style(sty.clone());
+    progress_indexing.set_message("Indexing progress");
+
     let mut callbacks = RemoteCallbacks::new();
 
-    callbacks.credentials(|url, username_from_url, allowed_types| {
-        eprintln!(
-            "Credentials callback for url={} username={} allowed={:?}",
-            url,
-            username_from_url.unwrap_or("none"),
-            allowed_types
-        );
+    callbacks.credentials(|_url, username_from_url, allowed_types| {
+        // eprintln!(
+        //     "Credentials callback for url={} username={} allowed={:?}",
+        //     url,
+        //     username_from_url.unwrap_or("none"),
+        //     allowed_types
+        // );
 
-        // For now just provide agent ssh creds
-        //
-        Cred::ssh_key_from_agent(username_from_url.unwrap_or("none"))
+        progress_client.set_message("Authenticating...");
+
+        if allowed_types.is_ssh_key() {
+            // Provide ssh key from current agent
+            //
+            Cred::ssh_key_from_agent(username_from_url.unwrap_or("none"))
+        } else if allowed_types.is_user_pass_plaintext() {
+            // Provide plaintext username / password if provided in args
+            //
+            match (
+                args.plaintext_username.as_ref(),
+                args.plaintext_password.as_ref(),
+            ) {
+                (Some(username), Some(password)) => Cred::userpass_plaintext(username, password),
+                _ => {
+                    eprintln!("Asked for plaintext credentials but none provided - maybe add -U and -P options?");
+                    Cred::default()
+                }
+            }
+        } else {
+            eprintln!("Unsupported credential type - returning default (which probably will fail)");
+            Cred::default()
+        }
     });
 
     callbacks.transfer_progress(|progress| {
-        let adjusted_byte =
-            Byte::from_u128(u128::try_from(progress.received_bytes()).unwrap()).unwrap();
-        eprintln!(
-            "Progress => Received {} of {}, indexed {}, bytes {}",
-            progress.received_objects(),
-            progress.total_objects(),
-            progress.indexed_objects(),
-            adjusted_byte.get_appropriate_unit(UnitType::Binary)
-        );
+        let received_byte = Byte::from_u128(u128::try_from(progress.received_bytes()).unwrap())
+            .unwrap()
+            .get_appropriate_unit(UnitType::Binary);
+
+        // eprintln!(
+        //     "Progress => Received {} of {}, indexed {}, bytes {}",
+        //     progress.received_objects(),
+        //     progress.total_objects(),
+        //     progress.indexed_objects(),
+        //     adjusted_byte.get_appropriate_unit(UnitType::Binary)
+        // );
+
+        progress_transfer.set_length(progress.total_objects() as u64);
+        progress_transfer.set_position(progress.received_objects() as u64);
+        progress_transfer.set_message(format!("Tranferred {received_byte:.2}"));
+
+        progress_indexing.set_length(progress.total_objects() as u64);
+        progress_indexing.set_position(progress.indexed_objects() as u64);
+
         true
     });
 
-    callbacks.pack_progress(|pack_builder_stage, b, c| {
+    callbacks.pack_progress(|pack_builder_stage, current, total| {
         eprintln!(
             "Packing => Stage {:?}, b {}, c {}",
-            pack_builder_stage, b, c
+            pack_builder_stage, current, total
         );
         ()
     });
 
-    // I'm not sure what this is - but log it anyways
-    //
     callbacks.sideband_progress(|sb| {
-        eprintln!("Sideband => {}", sb.len());
+        let msg = format!(
+            "Server: {}",
+            String::from_utf8_lossy(sb)
+                .to_string()
+                .replace("\n", "")
+                .replace("\r", "")
+        );
+        progress_server.set_message(msg);
         true
     });
 
@@ -187,31 +245,40 @@ fn extract_logs(repo_url: &str) -> Result<(), git2::Error> {
     builder.fetch_options(fo);
 
     let temp_dir = tempdir().map_err(|_e| git2::Error::from_str("TempDir failed!"))?;
-    eprintln!("Using tempdir => {}", temp_dir.path().to_str().unwrap());
-    let repo = builder.clone(repo_url, &temp_dir.path())?;
+    // eprintln!("Using tempdir => {}", temp_dir.path().to_str().unwrap());
+    progress_client.set_message("Cloning...");
+    let repo = builder.clone(args.repo_url.as_str(), &temp_dir.path())?;
+    progress_client.set_message("Clone complete");
 
     // Create the revwalk
     //
     let mut revwalk = repo.revwalk()?;
     revwalk.set_sorting(Sort::TIME)?;
-    eprintln!("Adding head");
+    // eprintln!("Adding head");
     revwalk.push_head()?;
+
+    // Complete all progress bars
+    //
+    progress_client.finish();
+    progress_server.finish();
+    progress_transfer.finish();
+    progress_indexing.finish();
 
     // Add all branches to the revwalk
     //
     let branches = repo.branches(None)?;
     for branch_r in branches {
-        if let Ok((branch, branch_type)) = branch_r {
+        if let Ok((branch, _branch_type)) = branch_r {
             if !branch.is_head() {
-                eprintln!(
-                    "Adding branch => {} {:?}",
-                    branch.name()?.unwrap_or("unnamed"),
-                    branch_type
-                );
+                // eprintln!(
+                //     "Adding branch => {} {:?}",
+                //     branch.name()?.unwrap_or("unnamed"),
+                //     branch_type
+                // );
                 if let Some(target) = branch.get().target() {
                     revwalk.push(target)?;
                 } else {
-                    eprintln!("No valid oid...");
+                    // eprintln!("No valid oid...");
                 }
             }
         }
@@ -244,7 +311,7 @@ fn extract_logs(repo_url: &str) -> Result<(), git2::Error> {
         let default_commit = Commit {
             id: oid.to_string(),
             r#type: CommitType::Normal,
-            repo_url: repo_url.to_string(),
+            repo_url: args.repo_url.to_string(),
             timestamp: commit.time().seconds(),
             author_name: commit.author().name().unwrap_or("unknown").to_string(),
             author_email: commit.author().email().unwrap_or("unknown").to_string(),
@@ -301,28 +368,34 @@ fn extract_logs(repo_url: &str) -> Result<(), git2::Error> {
             if let Ok(f) = my_flat_json {
                 println!("{}", f);
             }
-            //
-            //Ok(())
         });
-
-        //println!("{}", flat);
     }
 
     Ok(())
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
+#[derive(Parser, Debug)]
+struct Args {
+    #[arg(short = 'U', help = "Username to provide for PLAINTEXT auth")]
+    plaintext_username: Option<String>,
 
-    match args.get(1) {
-        None => eprintln!("usage: {} REPO_URL", args[0]),
-        Some(repo_url) => {
-            match extract_logs(repo_url) {
-                Ok(()) => eprintln!("Complete"),
-                Err(e) => eprintln!("Err {:?}", e),
-            };
+    #[arg(short = 'P', help = "Password to provide for PLAINTEXT auth")]
+    plaintext_password: Option<String>,
+
+    #[arg(help = "The URL of the repository to clone")]
+    repo_url: String,
+}
+
+fn main() {
+    let args = Args::parse();
+    // eprintln!("Args => {:?}", args);
+
+    match extract_logs(&args) {
+        Ok(()) => {
+            //eprintln!("Complete"),
         }
-    }
+        Err(e) => eprintln!("Err {:?}", e),
+    };
 
     ()
 }
