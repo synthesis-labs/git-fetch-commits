@@ -1,4 +1,6 @@
 [package]
+description = "A cool little tool for pulling commit data from a git repository"
+license = "MIT"
 name = "git-fetch-commits"
 version = "0.1.0"
 edition = "2021"
