@@ -25,4 +25,4 @@ JSON output is directed to stdout, whereas progress & logging directed to stderr
 
 # Git Authentication
 
-Currently only supports SSL Agent based auth - can easily be improved to support other methods.
+Currently supports SSL Agent based auth as well as Plaintext auth.
